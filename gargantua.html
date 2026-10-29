@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- The page cannot reach anything outside itself: no network requests, external scripts, fonts or images -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&#8203;</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Character ramp: empty -> dense
+const RAMP = " .`'-,:;~=+*xoO#%&@";
+const N = RAMP.length;
+const TL = 6;            // temperature levels (last level is used for stars)
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const asc = document.createElement('canvas'), actx = asc.getContext('2d');
+const atlas = document.createElement('canvas'), atx = atlas.getContext('2d');
+let W, H, dpr, fs, cw, ch, cols, rows, cwD, chD, dither;
+// ?t=<seconds> sets the start time; non-numeric / infinite / negative values are ignored
+const tParam = Number(new URLSearchParams(location.search).get('t'));
+const tStart = Number.isFinite(tParam) ? Math.min(Math.max(tParam, 0), 3600) : 0;
+let t0 = performance.now() - tStart * 1000;
+let paused = false, pauseAt = 0;
+
+const ROLL = -14 * Math.PI / 180;        // on-screen tilt (as in the film)
+const CR = Math.cos(ROLL), SR = Math.sin(ROLL);
+
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const smooth = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const lerp = (a, b, k) => a + (b - a) * k;
+
+function hash(x, y) {
+  let h = (x * 374761393 + y * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Hot accretion disk palette
+const STOPS = [
+  [0.00, [70, 18, 0]],
+  [0.30, [190, 70, 12]],
+  [0.55, [255, 150, 55]],
+  [0.78, [255, 214, 150]],
+  [1.00, [255, 250, 238]],
+];
+function color(b, ti) {
+  if (ti === TL - 1) { // star
+    return `rgb(${170 + 85 * b | 0},${185 + 70 * b | 0},255)`;
+  }
+  const tau = ti / (TL - 2);
+  let i = 0;
+  while (i < STOPS.length - 2 && b > STOPS[i + 1][0]) i++;
+  const [a0, c0] = STOPS[i], [a1, c1] = STOPS[i + 1];
+  const k = (b - a0) / (a1 - a0);
+  let r = lerp(c0[0], c1[0], k), g = lerp(c0[1], c1[1], k), bl = lerp(c0[2], c1[2], k);
+  g *= 0.72 + 0.5 * tau;
+  bl = bl * (0.45 + 1.0 * tau) + tau * b * 50;
+  r *= 0.9 + 0.1 * tau;
+  return `rgb(${clamp(r, 0, 255) | 0},${clamp(g, 0, 255) | 0},${clamp(bl, 0, 255) | 0})`;
+}
+
+function build() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = asc.width = Math.round(W * dpr);
+  cv.height = asc.height = Math.round(H * dpr);
+  const m = Math.min(W, H);
+  fs = Math.max(6, m / 82);
+  ch = fs; cw = fs * 0.6;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  cwD = Math.ceil(cw * dpr); chD = Math.ceil(ch * dpr);
+
+  atlas.width = cwD * N; atlas.height = chD * TL;
+  atx.clearRect(0, 0, atlas.width, atlas.height);
+  atx.font = `bold ${fs * dpr}px Consolas, "Courier New", monospace`;
+  atx.textBaseline = 'middle'; atx.textAlign = 'center';
+  for (let t = 0; t < TL; t++)
+    for (let i = 1; i < N; i++) {
+      atx.fillStyle = color(i / (N - 1), t);
+      atx.fillText(RAMP[i], i * cwD + cwD / 2, t * chD + chD / 2);
+    }
+
+  dither = new Float32Array(cols * rows);
+  for (let j = 0; j < rows; j++)
+    for (let i = 0; i < cols; i++) dither[j * cols + i] = hash(i * 7 + 3, j * 13 + 1) - 0.5;
+}
+
+function profile(R, rIn, rOut) {
+  if (R < rIn * 0.9 || R > rOut) return 0;
+  return smooth(rIn * 0.9, rIn * 1.12, R) * Math.pow(rIn / R, 1.35) * (1 - smooth(rOut * 0.55, rOut, R));
+}
+
+function texture(Rn, phi) {
+  const v = 0.55
+    + 0.20 * Math.sin(3 * phi + 4.0 * Rn)
+    + 0.14 * Math.sin(7 * phi - 9.0 * Rn + 1.3)
+    + 0.09 * Math.sin(13 * phi + 17.0 * Rn + 2.1)
+    + 0.16 * Math.sin(Rn * 26.0 + 2.0 * Math.sin(2 * phi + Rn));
+  return clamp(v, 0.08, 1.25);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) return;
+  const t = (now - t0) / 1000;
+
+  const m = Math.min(W, H);
+  const zoom = 0.8 + 0.22 * smooth(0, 28, t) + 0.012 * Math.sin(t * 0.35);
+  const fade = smooth(0.2, 3.5, t);
+  const rs = 0.15 * zoom;                
+  const sinT = 0.13;                    
+  const rIn = rs * 1.5, rOut = rs * 5.2;
+  const ox = W / 2, oy = H / 2;
+
+  actx.clearRect(0, 0, asc.width, asc.height);
+
+  for (let j = 0; j < rows; j++) {
+    const v0 = ((j + 0.5) * ch - oy) / m;
+    const yD = Math.round(j * ch * dpr);
+    for (let i = 0; i < cols; i++) {
+      const u0 = ((i + 0.5) * cw - ox) / m;
+      const u = u0 * CR - v0 * SR, v = u0 * SR + v0 * CR;
+      const r = Math.hypot(u, v);
+      let I = 0, dop = 0, wsum = 0;
+
+      const dz = v / sinT;
+      const Rd = Math.hypot(u, dz);
+      if (Rd > rIn * 0.9 && Rd < rOut && (dz > 0 || r > rs)) {
+        const om = 1.1 * Math.pow(rIn / Rd, 1.5);
+        const phi = Math.atan2(dz, u) + t * om;
+        const d = -u / Rd;                     
+        const beam = 1 + 0.22 * d * Math.sqrt(rIn / Rd);
+        const val = profile(Rd, rIn, rOut) * texture(Rd / rs, phi) * beam * (dz > 0 && r < rs ? 2.0 : 1.4);
+        I += val; dop += d * val; wsum += val;
+      }
+
+      if (r < rs * 1.08) {
+        const vc = rIn * sinT * 1.1, hw = rs * 0.16;
+        const gv = (v - vc) / hw;
+        const w = Math.exp(-gv * gv) * (1 - smooth(rs * 0.92, rs * 1.08, r));
+        if (w > 0.01) {
+          const Rx = Math.hypot(u, rIn * 1.02);
+          const phi = Math.atan2(rIn, u) + t * 1.1 * Math.pow(rIn / Rx, 1.5);
+          const d = -u / Rx;
+          const val = w * profile(Math.max(Rx, rIn * 1.15), rIn, rOut)
+            * (0.55 + 0.45 * texture(Rx / rs + gv * 0.15, phi)) * 2.6 * (1 + 0.15 * d);
+          I += val; dop += d * val; wsum += val;
+        }
+      }
+
+      if (r > rs) {
+        const a = (r - rs * 1.03) / rs;
+        if (a > 0) {
+          const s = Math.abs(v) / r;
+          const up = v < 0;
+          const K = up ? 3.6 : 9.0;            
+          const Rl = rIn * 0.95 + a * rs * K / (0.5 + 0.5 * s);
+          const p = profile(Rl, rIn, rOut);
+          if (p > 0) {
+            const ang = Math.atan2(v, u);
+            const om = 1.1 * Math.pow(rIn / Rl, 1.5);
+            const d = -u / r;
+            const beam = 1 + 0.18 * d;
+            const val = p * texture(Rl / rs, ang * (up ? 1 : -1) + t * om)
+              * (0.55 + 0.45 * Math.pow(s, 0.5)) * (up ? 1.9 : 1.2) * beam;
+            I += val; dop += d * val; wsum += val;
+          }
+        }
+      }
+
+      const q = (r - rs * 1.02) / (rs * 0.024);
+      const ring = 1.5 * Math.exp(-q * q) + 0.35 * Math.exp(-Math.pow((r - rs * 1.075) / (rs * 0.05), 2));
+      I += ring * (1 + 0.1 * (-u / Math.max(r, 1e-4)));
+      dop += 0.6 * ring; wsum += ring;
+
+      I *= fade;
+      let b = 1 - Math.exp(-2.6 * I);
+      let ti;
+      const tau = wsum > 0 ? clamp(0.45 + 0.3 * dop / wsum, 0, 0.999) : 0.4;
+      ti = Math.floor(tau * (TL - 1));
+
+      if (r > rs * 1.0 && b < 0.35) {
+        const k = 1 - 1.7 * rs * rs / (r * r);
+        const lx = u * k + t * 0.004, ly = v * k;
+        const gx = Math.floor(lx * m / cw), gy = Math.floor(ly * m / ch);
+        const h = hash(gx, gy);
+        if (h < 0.012) {
+          const sb = (0.2 + 0.7 * hash(gx + 17, gy - 9)) * (0.65 + 0.35 * Math.sin(t * 2.3 + h * 1500)) * fade;
+          if (sb > b) { b = sb * 0.75; ti = TL - 1; }
+        }
+      }
+
+      let idx = Math.floor(b * (N - 1) + 0.5 + dither[j * cols + i] * 0.7);
+      if (idx <= 0) continue;
+      if (idx > N - 1) idx = N - 1;
+      actx.drawImage(atlas, idx * cwD, ti * chD, cwD, chD,
+        Math.round(i * cw * dpr), yD, cwD, chD);
+    }
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.filter = 'none'; ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.filter = `blur(${16 * dpr}px)`; ctx.globalAlpha = 0.6; ctx.drawImage(asc, 0, 0);
+  ctx.filter = `blur(${4 * dpr}px)`;  ctx.globalAlpha = 0.45; ctx.drawImage(asc, 0, 0);
+  ctx.filter = 'none'; ctx.globalAlpha = 1; ctx.drawImage(asc, 0, 0);
+
+  ctx.globalCompositeOperation = 'source-over';
+  const g = ctx.createRadialGradient(cv.width / 2, cv.height / 2, Math.min(cv.width, cv.height) * 0.35,
+    cv.width / 2, cv.height / 2, Math.max(cv.width, cv.height) * 0.75);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.7)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, cv.width, cv.height);
+
+}
+
+addEventListener('resize', build);
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === ' ') {
+    paused = !paused;
+    if (paused) pauseAt = performance.now(); else t0 += performance.now() - pauseAt;
+  } else if (k === 'r') { t0 = performance.now(); paused = false; }
+  else if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); }
+});
+
+build();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
