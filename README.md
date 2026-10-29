@@ -54,8 +54,11 @@ A real-time ASCII animation inspired by Gargantua from *Interstellar*, running r
 ## 🚀 Quick Start
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/musarda/gargantua-ascii.git
+cd gargantua-ascii
 ```
+
+<sub>No git? Click **Code → Download ZIP** at the top of this page and extract it.</sub>
 
 Then pick **one of two ways**:
 
